@@ -1,0 +1,176 @@
+-- Enable UUID extension
+create extension if not exists "uuid-ossp";
+
+-- 1. USERS TABLE
+create table if not exists public.users (
+  id uuid references auth.users not null primary key,
+  email text,
+  username text,
+  avatar text,
+  joined_date text,
+  total_points bigint default 0,
+  last_daily_claim bigint default 0,
+  badges text[] default '{}'
+);
+
+-- MIGRATION: Ensure 'role' column exists even if table was created previously
+alter table public.users add column if not exists role text default 'user';
+
+-- 2. USER PROGRESS TABLE
+create table if not exists public.user_progress (
+  user_id uuid references public.users(id) not null,
+  game_id text not null,
+  level_id int default 1,
+  primary key (user_id, game_id)
+);
+
+-- 3. COLLECTED VERSES TABLE
+create table if not exists public.collected_verses (
+  id uuid default uuid_generate_v4() primary key,
+  user_id uuid references public.users(id) not null,
+  verse_text text not null
+);
+
+-- 4. UNLOCKED ACHIEVEMENTS TABLE
+create table if not exists public.unlocked_achievements (
+  id uuid default uuid_generate_v4() primary key,
+  user_id uuid references public.users(id) not null,
+  achievement_id text not null
+);
+
+-- 5. USER PLANS TABLE
+create table if not exists public.user_plans (
+  id text not null, 
+  user_id uuid references public.users(id) not null,
+  title text,
+  description text,
+  category text,
+  image text,
+  duration int,
+  progress int default 0,
+  is_active boolean default false,
+  start_date text,
+  end_date text,
+  days_json jsonb,
+  updated_at text,
+  primary key (user_id, id)
+);
+
+-- 6. SUPPORT TICKETS TABLE
+create table if not exists public.support_tickets (
+  id text not null primary key,
+  user_id uuid references public.users(id) not null,
+  subject text,
+  category text,
+  status text,
+  created_at bigint,
+  last_updated bigint,
+  messages_json jsonb
+);
+
+-- 7. CHAT MESSAGES TABLE (Journey TV)
+create table if not exists public.chat_messages (
+  id uuid default uuid_generate_v4() primary key,
+  user_id uuid references public.users(id) not null,
+  username text not null,
+  avatar text,
+  message text not null,
+  created_at timestamp with time zone default now()
+);
+
+-- 8. SOCIAL INTERACTIONS TABLE (New)
+-- Records likes, prayers, shares, and comments for analytics and history
+create table if not exists public.social_interactions (
+  id uuid default uuid_generate_v4() primary key,
+  user_id uuid references public.users(id) not null,
+  action_type text not null, -- 'like', 'pray', 'comment', 'share'
+  entity_context text, -- e.g. 'Daily Devotional', 'Level 1'
+  created_at timestamp with time zone default now()
+);
+
+-- --- SECURITY POLICIES (RLS) ---
+-- Enable RLS on all tables
+alter table public.users enable row level security;
+alter table public.user_progress enable row level security;
+alter table public.collected_verses enable row level security;
+alter table public.unlocked_achievements enable row level security;
+alter table public.user_plans enable row level security;
+alter table public.support_tickets enable row level security;
+alter table public.chat_messages enable row level security;
+alter table public.social_interactions enable row level security;
+
+-- Create permissive policies for Development (Allow All for authenticated users is safer)
+-- NOTE: In production, tighten these to: using (auth.uid() = user_id)
+
+-- Users
+drop policy if exists "Public Access Users" on public.users;
+create policy "Public Access Users" on public.users for select using (true);
+
+drop policy if exists "Auth Update Users" on public.users;
+create policy "Auth Update Users" on public.users for update using (auth.uid() = id);
+
+drop policy if exists "Auth Insert Users" on public.users;
+create policy "Auth Insert Users" on public.users for insert with check (auth.uid() = id);
+
+-- General Data (Progress, Verses, etc)
+-- Using simple 'true' for dev speed, but ideally restrict to owner
+
+drop policy if exists "Allow all access progress" on public.user_progress;
+create policy "Allow all access progress" on public.user_progress for all using (true) with check (true);
+
+drop policy if exists "Allow all access verses" on public.collected_verses;
+create policy "Allow all access verses" on public.collected_verses for all using (true) with check (true);
+
+drop policy if exists "Allow all access achievements" on public.unlocked_achievements;
+create policy "Allow all access achievements" on public.unlocked_achievements for all using (true) with check (true);
+
+drop policy if exists "Allow all access plans" on public.user_plans;
+create policy "Allow all access plans" on public.user_plans for all using (true) with check (true);
+
+drop policy if exists "Allow all access tickets" on public.support_tickets;
+create policy "Allow all access tickets" on public.support_tickets for all using (true) with check (true);
+
+-- Chat
+drop policy if exists "Public Read Chat" on public.chat_messages;
+create policy "Public Read Chat" on public.chat_messages for select using (true);
+
+drop policy if exists "Auth Insert Chat" on public.chat_messages;
+create policy "Auth Insert Chat" on public.chat_messages for insert to authenticated with check (true);
+
+drop policy if exists "Admin Delete Chat" on public.chat_messages;
+create policy "Admin Delete Chat" on public.chat_messages for delete using (
+  exists (select 1 from public.users where id = auth.uid() and role = 'admin')
+);
+
+-- Social Interactions
+drop policy if exists "Auth Insert Social" on public.social_interactions;
+create policy "Auth Insert Social" on public.social_interactions for insert to authenticated with check (true);
+
+drop policy if exists "Public Read Social" on public.social_interactions;
+create policy "Public Read Social" on public.social_interactions for select using (true);
+
+-- --- REALTIME SETUP ---
+begin;
+  drop publication if exists supabase_realtime;
+  create publication supabase_realtime;
+commit;
+alter publication supabase_realtime add table public.chat_messages;
+
+-- --- STORAGE SETUP ---
+insert into storage.buckets (id, name, public)
+values ('journey_assets', 'journey_assets', true)
+on conflict (id) do nothing;
+
+-- Storage Policies
+drop policy if exists "Public Access" on storage.objects;
+create policy "Public Access" on storage.objects for select using ( bucket_id = 'journey_assets' );
+
+drop policy if exists "Auth Uploads" on storage.objects;
+create policy "Auth Uploads" on storage.objects for insert to authenticated with check ( bucket_id = 'journey_assets' );
+
+drop policy if exists "Auth Updates" on storage.objects;
+create policy "Auth Updates" on storage.objects for update to authenticated using ( bucket_id = 'journey_assets' );
+
+-- *** ADMIN PROMOTION ***
+-- To make your user an admin, run this query in the Supabase SQL Editor:
+-- update public.users set role = 'admin' where email = 'YOUR_EMAIL_HERE';
